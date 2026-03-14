@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from backend.api.sessions import router as sessions_router
+
 app = FastAPI(title="EarningsLens API", version="1.0.0")
 
 app.add_middleware(
@@ -14,6 +16,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(sessions_router, prefix="/api")
+
 
 @app.get("/health")
 async def health():
