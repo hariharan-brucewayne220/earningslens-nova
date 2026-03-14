@@ -1,5 +1,51 @@
 # EarningsLens — Claude Code Project Instructions (PRD v2.0)
 
+---
+
+## ⚠️ HACKATHON RULES — NON-NEGOTIABLE (READ FIRST)
+
+### Core Requirement
+**The core solution MUST use Amazon Nova foundation models and/or Nova Act.**
+- Acceptable: Nova 2 Lite, Nova 2 Sonic, Nova Multimodal Embeddings, Nova Act
+- NOT acceptable: Titan Embed, Polly, or any non-Nova model as a primary component
+- If a Nova model fails, fix the integration — do NOT silently fall back to non-Nova models
+
+### Nova Component Rules
+- **Nova 2 Lite** (`amazon.nova-lite-v1:0`): reasoning, claim extraction, verification, briefing text generation ✅
+- **Nova Multimodal Embeddings**: use `amazon.titan-embed-image-v1` IS WRONG — must use Nova's own multimodal embedding model. Check model catalog for correct ID.
+- **Nova Act**: navigates SEC EDGAR UI autonomously. SDK = `nova-act`. Must be visibly used in demo — NOT replaced by REST API calls.
+- **Nova 2 Sonic** (`amazon.nova-sonic-v1:0`): speech-to-speech ONLY. NOT Amazon Polly. Sonic requires bidirectional streaming via Bedrock — implement it properly.
+
+### Judging Criteria (internalize this)
+- **Technical Implementation — 60%**: quality, effectiveness, successful Nova integration, architecture
+- **Enterprise/Community Impact — 20%**: business value or community benefit
+- **Creativity/Innovation — 20%**: novelty, innovative multi-agent use
+
+**60% is on Nova integration quality. Every fallback to a non-Nova model costs us the competition.**
+
+### Submission Checklist (must complete)
+- [ ] Demo video ~3 minutes with `#AmazonNova` hashtag
+- [ ] Code repo shared with testing@devpost.com AND Amazon-Nova-hackathon@amazon.com
+- [ ] Blog post published on builder.aws.com (covers community impact, real-world use, adoption plans) — bonus $200 AWS credits per winner, 100 winners
+- [ ] Feedback survey filled out — $50 cash prize (60 winners)
+- [ ] Primary category: **Agentic AI** (also eligible for Best of Multimodal Understanding, Best of Voice AI, Best Student App)
+
+### Blog Post Rules (bonus prize)
+Must cover:
+1. How the project positively affects the target community (financial analysts, retail investors)
+2. Potential benefits and envisioned real-world application
+3. Plans for encouraging adoption
+Platform: builder.aws.com | Length: ~1,200 words | Include `#AmazonNova`
+
+### Prize Targets
+- First Overall: $15,000 cash + $5,000 AWS credits
+- Best of Agentic System: $3,000 + $5,000 credits
+- Best of Multimodal Understanding: $3,000 + $5,000 credits
+- Best of Voice AI: $3,000 + $5,000 credits
+- Best Student App: $3,000 + $5,000 credits (Hariharan is a grad student job searching — this is authentic)
+
+---
+
 ## Project Overview
 
 EarningsLens is a real-time AI earnings call intelligence agent for the Amazon Nova AI Hackathon.
