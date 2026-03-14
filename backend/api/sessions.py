@@ -7,7 +7,11 @@ POST   /session/start
 POST   /session/{session_id}/upload-audio
 GET    /session/{session_id}/transcript
 GET    /session/{session_id}/status
+POST   /session/{session_id}/prefetch
+GET    /session/{session_id}/claims
+POST   /session/{session_id}/process
 """
+import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +24,8 @@ from pydantic import BaseModel
 from backend.audio.ingestor import AudioIngestor, SUPPORTED_FORMATS
 from backend.audio.transcribe_client import TranscribeClient
 from backend.audio import redis_store
+from backend.macrodash.client import MacroDashClient
+from backend.verification.pipeline import VerificationPipeline
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -268,3 +274,106 @@ async def get_session_status(session_id: str):
         transcribe_job_name=session.get("transcribe_job_name"),
         s3_uri=session.get("s3_uri"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: MacroDash pre-fetch endpoint
+# ---------------------------------------------------------------------------
+
+class PrefetchRequest(BaseModel):
+    ticker: str
+
+
+class PrefetchResponse(BaseModel):
+    session_id: str
+    ticker: str
+    cached_keys: list[str]
+    status: str
+
+
+@router.post("/{session_id}/prefetch", response_model=PrefetchResponse)
+async def prefetch_macrodash(session_id: str, body: PrefetchRequest):
+    """
+    Pre-fetch all MacroDash data (technical indicators, stock detail,
+    economic data, sentiment, news) concurrently and cache in Redis.
+
+    Returns the list of keys that were successfully cached.
+    """
+    _require_redis_session(session_id)
+
+    ticker = body.ticker.upper()
+    client = MacroDashClient()
+
+    data = await client.prefetch_all(ticker)
+    client.cache_to_redis(session_id, ticker, data)
+
+    cached_keys = [k for k, v in data.items() if v]
+
+    return PrefetchResponse(
+        session_id=session_id,
+        ticker=ticker,
+        cached_keys=cached_keys,
+        status="ready",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Claims endpoints
+# ---------------------------------------------------------------------------
+
+class ClaimsResponse(BaseModel):
+    session_id: str
+    claims: list[dict]
+    total: int
+    verified: int
+    flagged: int
+    unverifiable: int
+
+
+class ProcessRequest(BaseModel):
+    ticker: str
+    transcript: str
+
+
+class ProcessResponse(BaseModel):
+    claims: list[dict]
+
+
+@router.get("/{session_id}/claims", response_model=ClaimsResponse)
+async def get_claims(session_id: str):
+    """
+    Return all verified claim results for a session from Redis.
+    """
+    _require_redis_session(session_id)
+
+    pipeline = VerificationPipeline(session_id)
+    claims = pipeline.get_all_results()
+
+    verdicts = [c.get("verdict", "UNVERIFIABLE") for c in claims]
+    return ClaimsResponse(
+        session_id=session_id,
+        claims=claims,
+        total=len(claims),
+        verified=verdicts.count("VERIFIED"),
+        flagged=verdicts.count("FLAGGED"),
+        unverifiable=verdicts.count("UNVERIFIABLE"),
+    )
+
+
+@router.post("/{session_id}/process", response_model=ProcessResponse)
+async def process_transcript(session_id: str, body: ProcessRequest):
+    """
+    Run one batch of claim extraction + triple-source verification on the
+    provided transcript text.
+
+    Returns the verified claims immediately (synchronous processing).
+    """
+    _require_redis_session(session_id)
+
+    pipeline = VerificationPipeline(session_id)
+    results = await pipeline.process_transcript_batch(
+        transcript_text=body.transcript,
+        ticker=body.ticker,
+    )
+
+    return ProcessResponse(claims=results)
