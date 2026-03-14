@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backend.api.sessions import router as sessions_router
+from backend.api.filing import router as filing_router
+from backend.api.embedding import router as embedding_router
 
 app = FastAPI(title="EarningsLens API", version="1.0.0")
 
@@ -18,6 +20,8 @@ app.add_middleware(
 )
 
 app.include_router(sessions_router, prefix="/api")
+app.include_router(filing_router, prefix="/api")
+app.include_router(embedding_router, prefix="/api")
 
 
 @app.get("/health")
