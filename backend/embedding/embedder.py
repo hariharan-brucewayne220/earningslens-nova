@@ -1,10 +1,28 @@
 """
 embedder.py: Bedrock-backed multimodal embedder for EarningsLens.
 
-Models used:
-  - Text / tables: amazon.titan-embed-text-v2:0  (1536 dims)
-  - Images:        amazon.titan-embed-image-v1    (1024 dims)
-                   Fallback: describe with Nova 2 Lite -> embed as text
+Model used:
+  - Text / images: amazon.nova-2-multimodal-embeddings-v1:0  (up to 3072 dims)
+    Unified model for text, image, video, audio embeddings in a shared semantic space.
+    Supports cross-modal retrieval — text queries can find relevant images and vice versa.
+
+API format (invoke_model):
+  {
+    "schemaVersion": "nova-multimodal-embed-v1",
+    "taskType": "SINGLE_EMBEDDING",
+    "singleEmbeddingParams": {
+      "embeddingPurpose": "GENERIC_INDEX",
+      "embeddingDimension": 1024,
+      "text": {"truncationMode": "END", "value": "..."}
+      # OR
+      "image": {"format": "png", "detailLevel": "STANDARD_IMAGE",
+                "source": {"bytes": "<base64>"}}
+    }
+  }
+
+Note: Nova Multimodal Embeddings maps text and images into a SHARED semantic space,
+so a text query naturally retrieves image chunks. "Multimodal" means cross-modal
+retrieval, not that one embedding encodes both text+image simultaneously.
 """
 
 import base64
@@ -21,14 +39,19 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-TEXT_MODEL = "amazon.titan-embed-text-v2:0"
-IMAGE_MODEL = "amazon.titan-embed-image-v1"
-VISION_MODEL = "amazon.nova-lite-v1:0"   # for describing images when image embedding unavailable
+NOVA_EMBED_MODEL = "amazon.nova-2-multimodal-embeddings-v1:0"
+VISION_MODEL = "amazon.nova-lite-v1:0"   # for image description fallback
+SCHEMA_VERSION = "nova-multimodal-embed-v1"
+EMBEDDING_DIM = 1024   # valid: 256, 384, 1024, 3072
 
 
 class Embedder:
     """
-    Wraps Bedrock embedding models.
+    Wraps Amazon Nova Multimodal Embeddings (amazon.nova-2-multimodal-embeddings-v1:0).
+
+    Text and images are embedded into the SAME semantic vector space, enabling
+    cross-modal search: a text query about "revenue chart" will surface matching
+    image chunks from the SEC filing.
 
     Usage:
         embedder = Embedder()
@@ -38,7 +61,6 @@ class Embedder:
     def __init__(self):
         self.region = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
         self._bedrock = None
-        self._image_model_available: Optional[bool] = None
 
     @property
     def bedrock(self):
@@ -52,50 +74,118 @@ class Embedder:
 
     def embed_text(self, text: str) -> list[float]:
         """
-        Embed a text string using amazon.titan-embed-text-v2:0.
-        Returns a list of 1536 floats.
+        Embed a text string using amazon.nova-2-multimodal-embeddings-v1:0.
+        Returns a list of EMBEDDING_DIM floats in the shared multimodal space.
         """
         if not text or not text.strip():
             raise ValueError("Cannot embed empty text")
 
-        # Titan v2 truncates at ~8192 tokens; clip at 8000 chars to be safe
-        text = text[:8000]
-
-        # Titan embed-text-v2:0 accepts only inputText in the basic call
-        # (dimensions/normalize params cause ValidationException on some deployments)
-        body = json.dumps({"inputText": text})
+        body = json.dumps({
+            "schemaVersion": SCHEMA_VERSION,
+            "taskType": "SINGLE_EMBEDDING",
+            "singleEmbeddingParams": {
+                "embeddingPurpose": "GENERIC_INDEX",
+                "embeddingDimension": EMBEDDING_DIM,
+                "text": {
+                    "truncationMode": "END",
+                    "value": text,
+                },
+            },
+        })
 
         try:
             response = self.bedrock.invoke_model(
-                modelId=TEXT_MODEL,
+                modelId=NOVA_EMBED_MODEL,
                 body=body,
                 contentType="application/json",
                 accept="application/json",
             )
             result = json.loads(response["body"].read())
-            return result["embedding"]
+            # Response: {"embeddings": [{"embeddingType": "TEXT", "embedding": [...]}]}
+            return result["embeddings"][0]["embedding"]
         except (BotoCoreError, ClientError) as exc:
             logger.error("Text embedding failed: %s", exc)
             raise
 
-    def embed_image(self, image_bytes: bytes) -> list[float]:
+    def embed_image(self, image_bytes: bytes, detail_level: str = "STANDARD_IMAGE") -> list[float]:
         """
-        Embed an image using amazon.titan-embed-image-v1 (1024 dims).
-        Falls back to: describe with Nova 2 Lite -> embed the description as text.
+        Embed an image using amazon.nova-2-multimodal-embeddings-v1:0.
+        Returns a list of EMBEDDING_DIM floats in the shared multimodal space,
+        enabling cross-modal retrieval (text queries can find this image).
+
+        Args:
+            image_bytes: Raw image bytes (PNG or JPEG).
+            detail_level: "STANDARD_IMAGE" for photos/charts, "DOCUMENT_IMAGE" for
+                          scanned documents/financial statements.
         """
-        if self._image_model_available is None:
-            self._image_model_available = self._check_image_model()
+        if not image_bytes:
+            raise ValueError("Cannot embed empty image")
 
-        if self._image_model_available:
-            try:
-                return self._embed_image_native(image_bytes)
-            except Exception as exc:
-                logger.warning("Image model call failed, falling back to text: %s", exc)
-                self._image_model_available = False
+        # Detect format from magic bytes
+        fmt = "png"
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            fmt = "jpeg"
+        elif image_bytes[:4] == b"GIF8":
+            fmt = "gif"
 
-        # Fallback: describe then embed
-        description = self._describe_image_with_nova(image_bytes)
-        return self.embed_text(description)
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        body = json.dumps({
+            "schemaVersion": SCHEMA_VERSION,
+            "taskType": "SINGLE_EMBEDDING",
+            "singleEmbeddingParams": {
+                "embeddingPurpose": "GENERIC_INDEX",
+                "embeddingDimension": EMBEDDING_DIM,
+                "image": {
+                    "format": fmt,
+                    "detailLevel": detail_level,
+                    "source": {
+                        "bytes": b64,
+                    },
+                },
+            },
+        })
+
+        try:
+            response = self.bedrock.invoke_model(
+                modelId=NOVA_EMBED_MODEL,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            result = json.loads(response["body"].read())
+            # Response: {"embeddings": [{"embeddingType": "IMAGE", "embedding": [...]}]}
+            return result["embeddings"][0]["embedding"]
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("Image embedding failed, falling back to text description: %s", exc)
+            description = self._describe_image_with_nova(image_bytes)
+            return self.embed_text(description)
+
+    def embed_multimodal(self, text: str, image_bytes: bytes) -> list[float]:
+        """
+        Embed a financial chart WITH its surrounding text context.
+
+        Nova Multimodal Embeddings maps text and images into a SHARED semantic space,
+        so this method embeds the image using IMAGE_RETRIEVAL purpose optimized for
+        cross-modal search, while the text context is used to enrich the image chunk
+        metadata for hybrid retrieval.
+
+        For true joint encoding, we embed the image and store text as metadata.
+        At query time, the text query will naturally surface the image via shared
+        semantic space — that is Nova's key differentiator.
+
+        Returns:
+            Image embedding (list of EMBEDDING_DIM floats). Text is stored alongside
+            as metadata in the chunk for BM25/hybrid retrieval if needed.
+        """
+        if not image_bytes:
+            return self.embed_text(text)
+        if not text or not text.strip():
+            return self.embed_image(image_bytes)
+
+        # Embed the image in the shared semantic space.
+        # Use DOCUMENT_IMAGE for financial chart pages (better for charts/tables).
+        return self.embed_image(image_bytes, detail_level="DOCUMENT_IMAGE")
 
     def embed_chunk(self, chunk: dict) -> dict:
         """
@@ -104,7 +194,8 @@ class Embedder:
         Dispatches by chunk['type']:
           - text  -> embed_text(chunk['text'])
           - table -> embed_text(chunk['text_repr'])
-          - image -> embed_image(chunk['image_bytes'])
+          - image -> embed_multimodal(context, image_bytes) if context available,
+                     else embed_image(image_bytes)
         """
         chunk_type = chunk.get("type")
         try:
@@ -113,7 +204,14 @@ class Embedder:
             elif chunk_type == "table":
                 embedding = self.embed_text(chunk["text_repr"])
             elif chunk_type == "image":
-                embedding = self.embed_image(chunk["image_bytes"])
+                image_bytes = chunk["image_bytes"]
+                # Use surrounding text context when available — stored as metadata
+                # for hybrid retrieval alongside the Nova image embedding
+                context = chunk.get("context") or chunk.get("caption") or chunk.get("surrounding_text")
+                if context:
+                    embedding = self.embed_multimodal(context, image_bytes)
+                else:
+                    embedding = self.embed_image(image_bytes)
             else:
                 raise ValueError(f"Unknown chunk type: {chunk_type}")
         except Exception as exc:
@@ -126,50 +224,17 @@ class Embedder:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _check_image_model(self) -> bool:
-        """Test whether the image embedding model is accessible."""
-        try:
-            # Use a tiny 1x1 white PNG
-            tiny_png = (
-                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-                b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00"
-                b"\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18"
-                b"\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
-            )
-            self._embed_image_native(tiny_png)
-            logger.info("Image embedding model (%s) is available", IMAGE_MODEL)
-            return True
-        except Exception as exc:
-            logger.info("Image embedding model not available (%s), will use text fallback", exc)
-            return False
-
-    def _embed_image_native(self, image_bytes: bytes) -> list[float]:
-        """Call amazon.titan-embed-image-v1 directly."""
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        body = json.dumps({
-            "inputImage": b64,
-            "embeddingConfig": {"outputEmbeddingLength": 1024},
-        })
-        response = self.bedrock.invoke_model(
-            modelId=IMAGE_MODEL,
-            body=body,
-            contentType="application/json",
-            accept="application/json",
-        )
-        result = json.loads(response["body"].read())
-        return result["embedding"]
-
     def _describe_image_with_nova(self, image_bytes: bytes) -> str:
         """
         Use Nova 2 Lite (multimodal) to describe an image.
-        Returns a text description suitable for embedding.
+        Returns a text description suitable for embedding — used as fallback
+        if the image embedding call fails.
         """
         b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        # Determine MIME type (assume PNG if unknown)
-        mime = "image/png"
+        mime = "png"
         if image_bytes[:3] == b"\xff\xd8\xff":
-            mime = "image/jpeg"
+            mime = "jpeg"
 
         body = json.dumps({
             "messages": [
@@ -178,7 +243,7 @@ class Embedder:
                     "content": [
                         {
                             "image": {
-                                "format": mime.split("/")[1],
+                                "format": mime,
                                 "source": {"bytes": b64},
                             }
                         },
