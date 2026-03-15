@@ -9,3 +9,5 @@ redis==5.0.8
 python-multipart==0.0.9
 aiofiles==24.1.0
 reportlab==4.2.2
+nova-act
+gtts

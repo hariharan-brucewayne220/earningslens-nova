@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.audio import redis_store
+from backend.briefing import simple_tts
 from backend.briefing.generator import BriefingGenerator
 from backend.briefing.sonic_tts import SonicTTS
 from backend.macrodash.client import MacroDashClient
@@ -176,7 +177,7 @@ async def end_session(session_id: str, body: EndSessionRequest):
     Steps:
       1. Fetch all claim results from Redis (results:{session_id})
       2. Generate briefing text via Nova 2 Lite (BriefingGenerator)
-      3. Synthesise to MP3 via SonicTTS (Nova Sonic → Polly fallback)
+      3. Synthesise to MP3 via gTTS (simple_tts)
       4. Upload to S3 if configured; also keep local copy
       5. Store briefing metadata in Redis (briefing:{session_id})
     """
@@ -189,13 +190,12 @@ async def end_session(session_id: str, body: EndSessionRequest):
     generator = BriefingGenerator()
     briefing_text = generator.generate_briefing_text(claims)
 
-    # Synthesise to audio
+    # Synthesise to audio using gTTS (Google TTS) for reliable briefing read-out
     audio_filename = f"{session_id}_briefing.mp3"
     local_audio_path = str(DATA_DIR / audio_filename)
 
     try:
-        tts = SonicTTS()
-        tts.synthesize(briefing_text, local_audio_path)
+        await simple_tts.synthesize_async(briefing_text, local_audio_path)
     except Exception as exc:
         logger.error("TTS synthesis failed for session %s: %s", session_id, exc)
         raise HTTPException(status_code=500, detail=f"Audio synthesis failed: {exc}")
@@ -267,15 +267,14 @@ async def qa(session_id: str, body: QARequest):
         context=context,
     )
 
-    # Synthesise to audio
+    # Synthesise response to audio using gTTS
     import uuid as _uuid
     qa_id = str(_uuid.uuid4())[:8]
     audio_filename = f"{session_id}_qa_{qa_id}.mp3"
     local_audio_path = str(DATA_DIR / audio_filename)
 
     try:
-        tts = SonicTTS()
-        tts.synthesize(response_text, local_audio_path)
+        await simple_tts.synthesize_async(response_text, local_audio_path)
     except Exception as exc:
         logger.error("QA TTS synthesis failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Audio synthesis failed: {exc}")
