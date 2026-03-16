@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 
-import redis as _redis_lib
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
@@ -90,10 +89,6 @@ async def event_generator(session_id: str):
                     })
                     yield f"data: {event}\n\n"
 
-        except _redis_lib.exceptions.ConnectionError as exc:
-            logger.warning("SSE Redis connection error for session %s: %s", session_id, exc)
-            event = json.dumps({"type": "error", "message": "Redis connection lost"})
-            yield f"data: {event}\n\n"
         except Exception as exc:  # noqa: BLE001
             logger.warning("SSE event generator error for session %s: %s", session_id, exc)
 

@@ -1,14 +1,8 @@
 """
-sonic_tts.py: Proven Amazon Nova 2 Sonic speech-to-speech client.
+sonic_tts.py: Nova 2 Sonic text-to-speech for post-call briefing.
 
-This module is intentionally built around the path we verified live:
-  - model: amazon.nova-2-sonic-v1:0
-  - bidirectional Bedrock streaming
-  - audio input: 16 kHz, mono, 16-bit PCM WAV
-  - audio output: 24 kHz, mono, 16-bit PCM WAV
-
-Nova 2 Sonic text-only TTS was not reliable in this environment, so the
-working API here is WAV-in/WAV-out rather than text-in/WAV-out.
+Sends briefing text to Nova Sonic as a TEXT user turn and collects
+the audio output. Used only for the end-of-call briefing summary.
 """
 
 import asyncio
@@ -41,299 +35,157 @@ logger = logging.getLogger(__name__)
 
 NOVA_SONIC_MODEL = "amazon.nova-2-sonic-v1:0"
 REGION = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
-INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
-INPUT_CHUNK_MS = 100
 TIMEOUT_SECONDS = 30
-VOICE_ID = "matthew"
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise assistant. "
-    "Listen to the user's speech and respond clearly and naturally."
+POST_COMPLETION_WAIT_SECONDS = 2.0
+VOICE_ID = "tiffany"
+
+READER_SYSTEM_PROMPT = (
+    "You are a professional financial analyst presenting a briefing. "
+    "Read the content provided by the user clearly and naturally, "
+    "as if delivering it to an audience. Do not add commentary."
 )
 
 
-class SonicTTS:
+async def synthesize_text(text: str, output_wav_path: str) -> str:
     """
-    Working Nova 2 Sonic wrapper.
-
-    Proven API:
-      - `transceive_wav()` / `transceive_wav_async()`
-
-    Unsupported in this environment:
-      - `synthesize()` / `synthesize_async()` text-only TTS
+    Send text to Nova 2 Sonic and write the spoken audio to output_wav_path.
+    Returns output_wav_path on success.
+    Falls back gracefully — caller should check if file exists.
     """
+    Path(output_wav_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, *, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> None:
-        self._region = REGION
-        self._system_prompt = system_prompt
+    config = Config(
+        endpoint_uri=f"https://bedrock-runtime.{REGION}.amazonaws.com",
+        region=REGION,
+        aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
+    )
+    client = BedrockRuntimeClient(config=config)
 
-    def synthesize(self, text: str, output_path: str) -> str:
-        """
-        Text-only TTS is intentionally disabled.
-
-        We verified that Nova 2 Sonic works with speech-to-speech in this
-        environment, but the text-only request path did not complete reliably.
-        """
-        raise RuntimeError(
-            "Nova 2 Sonic text-only TTS is not supported here. "
-            "Use transceive_wav(...) with a 16 kHz mono 16-bit PCM WAV input."
+    try:
+        stream = await asyncio.wait_for(
+            client.invoke_model_with_bidirectional_stream(
+                InvokeModelWithBidirectionalStreamOperationInput(model_id=NOVA_SONIC_MODEL)
+            ),
+            timeout=TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"Timed out connecting to Nova Sonic after {TIMEOUT_SECONDS}s") from exc
 
-    async def synthesize_async(self, text: str, output_path: str) -> str:
-        """Async form of synthesize(); intentionally unsupported."""
-        raise RuntimeError(
-            "Nova 2 Sonic text-only TTS is not supported here. "
-            "Use transceive_wav_async(...) with a 16 kHz mono 16-bit PCM WAV input."
+    prompt_name = str(uuid.uuid4())
+    system_content_name = str(uuid.uuid4())
+    user_content_name = str(uuid.uuid4())
+    completion_event = asyncio.Event()
+    audio_chunks: list[bytes] = []
+    receive_done = asyncio.Event()
+    receive_error: Exception | None = None
+
+    async def _send(payload: str) -> None:
+        chunk = InvokeModelWithBidirectionalStreamInputChunk(
+            value=BidirectionalInputPayloadPart(bytes_=payload.encode("utf-8"))
         )
+        await stream.input_stream.send(chunk)
 
-    def transceive_wav(self, input_wav_path: str, output_wav_path: str) -> str:
-        """Send a WAV file to Nova 2 Sonic and write the spoken reply as WAV."""
-        Path(output_wav_path).parent.mkdir(parents=True, exist_ok=True)
-        asyncio.run(self._run_wav(input_wav_path, output_wav_path))
-        return output_wav_path
-
-    async def transceive_wav_async(self, input_wav_path: str, output_wav_path: str) -> str:
-        """Async version of transceive_wav()."""
-        Path(output_wav_path).parent.mkdir(parents=True, exist_ok=True)
-        await self._run_wav(input_wav_path, output_wav_path)
-        return output_wav_path
-
-    async def _run_wav(self, input_wav_path: str, output_wav_path: str) -> None:
-        audio_bytes = _read_input_wav(input_wav_path)
-
-        config = Config(
-            endpoint_uri=f"https://bedrock-runtime.{self._region}.amazonaws.com",
-            region=self._region,
-            aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
-        )
-        client = BedrockRuntimeClient(config=config)
-        stream = await client.invoke_model_with_bidirectional_stream(
-            InvokeModelWithBidirectionalStreamOperationInput(model_id=NOVA_SONIC_MODEL)
-        )
-
-        prompt_name = str(uuid.uuid4())
-        system_content_name = str(uuid.uuid4())
-        user_content_name = str(uuid.uuid4())
-        audio_chunks: list[bytes] = []
-        first_audio_event = asyncio.Event()
-        completion_event = asyncio.Event()
-
-        async def _send_event(event_json: str) -> None:
-            event = InvokeModelWithBidirectionalStreamInputChunk(
-                value=BidirectionalInputPayloadPart(bytes_=event_json.encode("utf-8"))
-            )
-            await stream.input_stream.send(event)
-
-        async def _receive() -> None:
-            _, output_stream = await stream.await_output()
-            try:
-                async for event_data in output_stream:
-                    if event_data is None:
-                        continue
-                    if not isinstance(event_data, InvokeModelWithBidirectionalStreamOutputChunk):
-                        logger.debug("Nova Sonic: ignoring output event type %s", type(event_data).__name__)
-                        continue
-
-                    try:
-                        raw = event_data.value.bytes_.decode("utf-8")
-                        event = json.loads(raw).get("event", {})
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("Nova Sonic: could not decode output event: %s", exc)
-                        continue
-
-                    if "textOutput" in event:
-                        text = event["textOutput"].get("content", "")
-                        if text:
-                            logger.info("Nova Sonic textOutput: %s", text)
-                    elif "audioOutput" in event:
-                        content = event["audioOutput"].get("content")
-                        if content:
-                            audio_chunks.append(base64.b64decode(content))
-                            first_audio_event.set()
-                    elif "completionEnd" in event:
-                        logger.info("Nova Sonic: completionEnd received")
-                        completion_event.set()
-                        break
-                    elif "error" in event:
-                        raise RuntimeError(f"Nova Sonic error event: {event['error']}")
-            except ValidationException as exc:
-                raise RuntimeError(f"Nova Sonic validation error: {exc.message or exc}") from exc
-
-        receive_task = asyncio.create_task(_receive())
-
+    async def _receive() -> None:
+        nonlocal receive_error
         try:
-            init_events = _build_init_events(
-                prompt_name=prompt_name,
-                system_content_name=system_content_name,
-                system_prompt=self._system_prompt,
-            )
-            for event_json in init_events:
-                await _send_event(event_json)
+            _, output_stream = await stream.await_output()
+            async for event_data in output_stream:
+                if not isinstance(event_data, InvokeModelWithBidirectionalStreamOutputChunk):
+                    continue
+                try:
+                    raw = event_data.value.bytes_.decode("utf-8")
+                    event = json.loads(raw).get("event", {})
+                except Exception:
+                    continue
 
-            await _send_event(_content_start_audio_event(prompt_name, user_content_name))
-            chunk_size = INPUT_SAMPLE_RATE * SAMPLE_WIDTH * INPUT_CHUNK_MS // 1000
-            for idx in range(0, len(audio_bytes), chunk_size):
-                chunk = audio_bytes[idx:idx + chunk_size]
-                if chunk:
-                    await _send_event(_audio_input_event(prompt_name, user_content_name, chunk))
-                    await asyncio.sleep(INPUT_CHUNK_MS / 1000)
-            await _send_event(_content_end_event(prompt_name, user_content_name))
-            logger.info("Nova Sonic: audio input events sent")
-
-            await asyncio.wait_for(first_audio_event.wait(), timeout=TIMEOUT_SECONDS)
-            logger.info("Nova Sonic: first audioOutput received")
-
-            await _send_event(_prompt_end_event(prompt_name))
-            logger.info("Nova Sonic: promptEnd sent")
-
-            try:
-                await asyncio.wait_for(completion_event.wait(), timeout=TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                logger.info("Nova Sonic: completionEnd not received within %ss", TIMEOUT_SECONDS)
-
-            await _send_event(_session_end_event())
-            logger.info("Nova Sonic: sessionEnd sent")
+                if "audioOutput" in event:
+                    content = event["audioOutput"].get("content")
+                    if content:
+                        audio_chunks.append(base64.b64decode(content))
+                elif "completionEnd" in event:
+                    logger.info("Nova Sonic briefing: completionEnd received")
+                    completion_event.set()
+                elif "error" in event:
+                    raise RuntimeError(f"Nova Sonic error: {event['error']}")
+                else:
+                    logger.debug("Nova Sonic briefing event: %s", list(event.keys()))
+        except ValidationException as exc:
+            receive_error = exc
+        except Exception as exc:  # noqa: BLE001
+            receive_error = exc
         finally:
-            close_fn = getattr(stream.input_stream, "close", None)
-            if close_fn is not None:
-                result = close_fn()
-                if inspect.isawaitable(result):
-                    await result
-            await asyncio.gather(receive_task, return_exceptions=True)
+            receive_done.set()
 
-        if not audio_chunks:
-            raise RuntimeError("Nova Sonic returned no audio output")
+    receive_task = asyncio.create_task(_receive())
+    close_task: asyncio.Task | None = None
 
-        _write_output_wav(output_wav_path, b"".join(audio_chunks))
-        logger.info("Nova Sonic complete: %s", output_wav_path)
+    async def _close_after_completion() -> None:
+        try:
+            await asyncio.wait_for(completion_event.wait(), timeout=TIMEOUT_SECONDS)
+            await asyncio.sleep(POST_COMPLETION_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Nova Sonic briefing: completionEnd not received within %ss", TIMEOUT_SECONDS)
+        await _send(json.dumps({"event": {"sessionEnd": {}}}))
 
+    try:
+        # Session + prompt init
+        await _send(json.dumps({"event": {"sessionStart": {"inferenceConfiguration": {"maxTokens": 2048, "topP": 0.9, "temperature": 0.7}}}}))
+        await _send(json.dumps({"event": {"promptStart": {
+            "promptName": prompt_name,
+            "textOutputConfiguration": {"mediaType": "text/plain"},
+            "audioOutputConfiguration": {
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": OUTPUT_SAMPLE_RATE,
+                "sampleSizeBits": 16,
+                "channelCount": CHANNELS,
+                "voiceId": VOICE_ID,
+                "encoding": "base64",
+                "audioType": "SPEECH",
+            },
+        }}}))
 
-def _build_init_events(*, prompt_name: str, system_content_name: str, system_prompt: str) -> list[str]:
-    return [
-        json.dumps({
-            "event": {
-                "sessionStart": {
-                    "inferenceConfiguration": {
-                        "maxTokens": 1024,
-                        "topP": 0.9,
-                        "temperature": 0.7,
-                    }
-                }
-            }
-        }),
-        json.dumps({
-            "event": {
-                "promptStart": {
-                    "promptName": prompt_name,
-                    "textOutputConfiguration": {"mediaType": "text/plain"},
-                    "audioOutputConfiguration": {
-                        "mediaType": "audio/lpcm",
-                        "sampleRateHertz": OUTPUT_SAMPLE_RATE,
-                        "sampleSizeBits": 16,
-                        "channelCount": CHANNELS,
-                        "voiceId": VOICE_ID,
-                        "encoding": "base64",
-                        "audioType": "SPEECH",
-                    },
-                }
-            }
-        }),
-        json.dumps({
-            "event": {
-                "contentStart": {
-                    "promptName": prompt_name,
-                    "contentName": system_content_name,
-                    "type": "TEXT",
-                    "role": "SYSTEM",
-                    "interactive": True,
-                    "textInputConfiguration": {"mediaType": "text/plain"},
-                }
-            }
-        }),
-        json.dumps({
-            "event": {
-                "textInput": {
-                    "promptName": prompt_name,
-                    "contentName": system_content_name,
-                    "content": system_prompt,
-                }
-            }
-        }),
-        json.dumps({
-            "event": {
-                "contentEnd": {
-                    "promptName": prompt_name,
-                    "contentName": system_content_name,
-                }
-            }
-        }),
-    ]
+        # System prompt
+        await _send(json.dumps({"event": {"contentStart": {"promptName": prompt_name, "contentName": system_content_name, "type": "TEXT", "role": "SYSTEM", "interactive": False, "textInputConfiguration": {"mediaType": "text/plain"}}}}))
+        await _send(json.dumps({"event": {"textInput": {"promptName": prompt_name, "contentName": system_content_name, "content": READER_SYSTEM_PROMPT}}}))
+        await _send(json.dumps({"event": {"contentEnd": {"promptName": prompt_name, "contentName": system_content_name}}}))
 
+        # Briefing text as user turn
+        await _send(json.dumps({"event": {"contentStart": {"promptName": prompt_name, "contentName": user_content_name, "type": "TEXT", "role": "USER", "interactive": False, "textInputConfiguration": {"mediaType": "text/plain"}}}}))
+        await _send(json.dumps({"event": {"textInput": {"promptName": prompt_name, "contentName": user_content_name, "content": text}}}))
+        await _send(json.dumps({"event": {"contentEnd": {"promptName": prompt_name, "contentName": user_content_name}}}))
+        await _send(json.dumps({"event": {"promptEnd": {"promptName": prompt_name}}}))
 
-def _content_start_audio_event(prompt_name: str, content_name: str) -> str:
-    return json.dumps({
-        "event": {
-            "contentStart": {
-                "promptName": prompt_name,
-                "contentName": content_name,
-                "type": "AUDIO",
-                "role": "USER",
-                "interactive": True,
-                "audioInputConfiguration": {
-                    "mediaType": "audio/lpcm",
-                    "sampleRateHertz": INPUT_SAMPLE_RATE,
-                    "sampleSizeBits": 16,
-                    "channelCount": CHANNELS,
-                    "audioType": "SPEECH",
-                    "encoding": "base64",
-                },
-            }
-        }
-    })
+        logger.info("Nova Sonic briefing: text sent, waiting for audio...")
+        close_task = asyncio.create_task(_close_after_completion())
 
+        # Wait for receive to finish
+        await asyncio.wait_for(receive_done.wait(), timeout=TIMEOUT_SECONDS + POST_COMPLETION_WAIT_SECONDS + 5)
 
-def _audio_input_event(prompt_name: str, content_name: str, audio_bytes: bytes) -> str:
-    return json.dumps({
-        "event": {
-            "audioInput": {
-                "promptName": prompt_name,
-                "contentName": content_name,
-                "content": base64.b64encode(audio_bytes).decode("utf-8"),
-            }
-        }
-    })
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("Nova Sonic briefing timed out waiting for response") from exc
+    finally:
+        close_fn = getattr(stream.input_stream, "close", None)
+        if close_fn is not None:
+            result = close_fn()
+            if inspect.isawaitable(result):
+                await result
+        if close_task is not None:
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+        await asyncio.gather(receive_task, return_exceptions=True)
 
+    if receive_error:
+        raise RuntimeError(f"Nova Sonic briefing failed: {receive_error}")
 
-def _content_end_event(prompt_name: str, content_name: str) -> str:
-    return json.dumps({
-        "event": {
-            "contentEnd": {
-                "promptName": prompt_name,
-                "contentName": content_name,
-            }
-        }
-    })
+    if not audio_chunks:
+        raise RuntimeError("Nova Sonic returned no audio for briefing")
 
-
-def _prompt_end_event(prompt_name: str) -> str:
-    return json.dumps({"event": {"promptEnd": {"promptName": prompt_name}}})
-
-
-def _session_end_event() -> str:
-    return json.dumps({"event": {"sessionEnd": {}}})
-
-
-def _read_input_wav(path: str) -> bytes:
-    with wave.open(path, "rb") as wf:
-        if wf.getnchannels() != CHANNELS:
-            raise RuntimeError(f"Input WAV must be mono; got {wf.getnchannels()} channels")
-        if wf.getsampwidth() != SAMPLE_WIDTH:
-            raise RuntimeError(f"Input WAV must be 16-bit PCM; got sample width {wf.getsampwidth()}")
-        if wf.getframerate() != INPUT_SAMPLE_RATE:
-            raise RuntimeError(f"Input WAV must be {INPUT_SAMPLE_RATE} Hz; got {wf.getframerate()} Hz")
-        return wf.readframes(wf.getnframes())
+    _write_output_wav(output_wav_path, b"".join(audio_chunks))
+    logger.info("Nova Sonic briefing audio written: %s", output_wav_path)
+    return output_wav_path
 
 
 def _write_output_wav(path: str, pcm_data: bytes) -> None:

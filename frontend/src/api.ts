@@ -12,10 +12,11 @@ import type {
 const client = axios.create({
   baseURL: '/api',
   timeout: 30000,
+  headers: { 'Content-Type': 'application/json' },
 });
 
-export async function startSession(): Promise<{ session_id: string }> {
-  const res = await client.post('/session/start');
+export async function startSession(ticker: string = 'NVDA'): Promise<{ session_id: string }> {
+  const res = await client.post('/session/start', { ticker });
   return res.data as { session_id: string };
 }
 
@@ -26,8 +27,8 @@ export async function uploadAudio(
   const formData = new FormData();
   formData.append('file', file);
   const res = await client.post(`/session/${sessionId}/upload-audio`, formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 120000,
+    headers: { 'Content-Type': undefined },
   });
   return res.data;
 }
@@ -36,7 +37,7 @@ export async function prefetchSession(
   sessionId: string,
   ticker: string
 ): Promise<PrefetchResponse> {
-  const res = await client.post(`/session/${sessionId}/prefetch`, { ticker });
+  const res = await client.post(`/session/${sessionId}/prefetch`, { ticker }, { timeout: 90000 });
   return res.data as PrefetchResponse;
 }
 
@@ -49,8 +50,8 @@ export async function processSession(
   sessionId: string,
   ticker: string,
   transcript: string
-): Promise<{ claims: ClaimsResponse['claims'] }> {
-  const res = await client.post(`/session/${sessionId}/process`, { ticker, transcript });
+): Promise<{ claims: any[] }> {
+  const res = await client.post(`/session/${sessionId}/process`, { ticker, transcript }, { timeout: 120000 });
   return res.data;
 }
 
@@ -59,8 +60,8 @@ export async function getClaims(sessionId: string): Promise<ClaimsResponse> {
   return res.data as ClaimsResponse;
 }
 
-export async function endSession(sessionId: string): Promise<unknown> {
-  const res = await client.post(`/session/${sessionId}/end`);
+export async function endSession(sessionId: string, ticker: string): Promise<unknown> {
+  const res = await client.post(`/session/${sessionId}/end`, { ticker });
   return res.data;
 }
 
@@ -72,6 +73,14 @@ export async function getBriefing(sessionId: string): Promise<BriefingResponse> 
 export async function getReport(sessionId: string): Promise<unknown> {
   const res = await client.get(`/session/${sessionId}/report.json`);
   return res.data;
+}
+
+export async function getPdfReport(sessionId: string): Promise<Blob> {
+  const res = await client.get(`/session/${sessionId}/report.pdf`, {
+    responseType: 'blob',
+    timeout: 120000,
+  });
+  return res.data as Blob;
 }
 
 export async function fetchFiling(ticker: string): Promise<FilingFetchResponse> {

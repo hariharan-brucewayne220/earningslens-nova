@@ -15,7 +15,6 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-import redis as redis_lib
 from dotenv import load_dotenv
 
 from backend.embedding.embedder import Embedder
@@ -27,24 +26,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-def _get_redis() -> Optional[redis_lib.Redis]:
-    try:
-        url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-        r = redis_lib.from_url(url, decode_responses=True)
-        r.ping()
-        return r
-    except Exception as exc:
-        logger.warning("Redis unavailable for progress updates: %s", exc)
-        return None
+from backend.api.embedding import _jobs as _embed_jobs
 
 
-def _update_progress(r: Optional[redis_lib.Redis], job_id: str, data: dict) -> None:
-    if r is None:
-        return
-    try:
-        r.set(f"embed_job:{job_id}", json.dumps(data), ex=3600)
-    except Exception as exc:
-        logger.debug("Progress update failed: %s", exc)
+def _update_progress(_r: None, job_id: str, data: dict) -> None:
+    _embed_jobs[job_id] = data
 
 
 class EmbeddingPipeline:
@@ -69,10 +55,8 @@ class EmbeddingPipeline:
         Returns:
             A populated VectorStore instance (also persisted to disk).
         """
-        r = _get_redis()
-
         # Initial status
-        _update_progress(r, job_id, {
+        _update_progress(None, job_id, {
             "status": "extracting",
             "progress_pct": 0,
             "chunks_total": 0,
@@ -84,12 +68,12 @@ class EmbeddingPipeline:
         try:
             chunks = self.processor.extract_chunks(pdf_path)
         except Exception as exc:
-            _update_progress(r, job_id, {"status": "failed", "error": str(exc), "progress_pct": 0, "chunks_total": 0, "chunks_done": 0})
+            _update_progress(None, job_id, {"status": "failed", "error": str(exc), "progress_pct": 0, "chunks_total": 0, "chunks_done": 0})
             raise
 
         total = len(chunks)
         logger.info("[%s] Extracted %d chunks", job_id, total)
-        _update_progress(r, job_id, {
+        _update_progress(None, job_id, {
             "status": "embedding",
             "progress_pct": 5,
             "chunks_total": total,
@@ -112,7 +96,7 @@ class EmbeddingPipeline:
 
             if (i + 1) % 5 == 0 or (i + 1) == total:
                 pct = 5 + int(90 * (i + 1) / total)
-                _update_progress(r, job_id, {
+                _update_progress(None, job_id, {
                     "status": "embedding",
                     "progress_pct": pct,
                     "chunks_total": total,
@@ -135,7 +119,7 @@ class EmbeddingPipeline:
             "[%s] Pipeline complete. Stored %d/%d chunks (%d errors). Path: %s",
             job_id, done, total, errors, store_path,
         )
-        _update_progress(r, job_id, {
+        _update_progress(None, job_id, {
             "status": "complete",
             "progress_pct": 100,
             "chunks_total": total,

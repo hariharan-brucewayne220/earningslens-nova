@@ -31,6 +31,13 @@ NOVA_LITE_MODEL = "amazon.nova-lite-v1:0"
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
+def _payload_data(payload: dict | None) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
 class Verifier:
     """
     Verifies a single extracted claim against three evidence sources and
@@ -187,8 +194,8 @@ Rules:
                 "bb_position": "N/A",
             }
 
-        # MacroDash may nest data under 'indicators' or return it flat
-        indicators = tech_data.get("indicators", tech_data)
+        raw = _payload_data(tech_data)
+        indicators = raw.get("indicators", raw)
 
         def _safe(value: Any, fmt: str = ".2f") -> str:
             if value is None:
@@ -198,14 +205,20 @@ Rules:
             except (TypeError, ValueError):
                 return str(value)
 
-        rsi = _safe(indicators.get("rsi") or indicators.get("RSI"))
+        rsi_block = indicators.get("rsi", indicators.get("RSI", {}))
+        if isinstance(rsi_block, dict):
+            rsi = _safe(rsi_block.get("latest"))
+        else:
+            rsi = _safe(rsi_block)
 
         macd_block = indicators.get("macd", indicators.get("MACD", {}))
         if isinstance(macd_block, dict):
             macd_signal = _safe(
+                macd_block.get("latest_signal") or
                 macd_block.get("signal") or macd_block.get("macd_signal")
             )
             macd_histogram = _safe(
+                macd_block.get("latest_histogram") or
                 macd_block.get("histogram") or macd_block.get("macd_histogram")
             )
         else:
@@ -217,19 +230,20 @@ Rules:
             )
 
         # Bollinger band position: describe price relative to bands
-        bb_block = indicators.get("bollinger_bands", indicators.get("bollingerBands", {}))
+        bb_block = indicators.get("bbands", indicators.get("bollinger_bands", indicators.get("bollingerBands", {})))
         if isinstance(bb_block, dict):
-            upper = bb_block.get("upper") or bb_block.get("upper_band")
-            middle = bb_block.get("middle") or bb_block.get("mid") or bb_block.get("sma")
-            lower = bb_block.get("lower") or bb_block.get("lower_band")
-            price = tech_data.get("current_price") or tech_data.get("price")
+            upper = bb_block.get("latest_upper") or bb_block.get("upper") or bb_block.get("upper_band")
+            middle = bb_block.get("latest_middle") or bb_block.get("middle") or bb_block.get("mid") or bb_block.get("sma")
+            lower = bb_block.get("latest_lower") or bb_block.get("lower") or bb_block.get("lower_band")
+            price = raw.get("current_price") or raw.get("price")
             if upper and lower and price:
                 try:
                     u, l, p = float(upper), float(lower), float(price)
                     band_width = u - l
                     if band_width > 0:
                         position_pct = (p - l) / band_width * 100
-                        bb_position = f"{position_pct:.0f}% of band (upper={u:.2f}, mid={float(middle) if middle else 'N/A':.2f}, lower={l:.2f})"
+                        mid_display = f"{float(middle):.2f}" if middle not in (None, "N/A") else "N/A"
+                        bb_position = f"{position_pct:.0f}% of band (upper={u:.2f}, mid={mid_display}, lower={l:.2f})"
                     else:
                         bb_position = "N/A"
                 except (TypeError, ValueError):
@@ -258,6 +272,8 @@ Rules:
         if not eco_data:
             return "No macroeconomic data available."
 
+        raw = _payload_data(eco_data)
+
         def _val(keys: list[str], data: dict) -> str:
             for k in keys:
                 v = data.get(k)
@@ -271,23 +287,33 @@ Rules:
         lines = []
 
         # GDP
-        gdp = _val(["gdp_growth", "gdp_growth_rate", "GDP_growth", "realGDPGrowth"], eco_data)
+        gdp = _val(["gdp_growth", "gdp_growth_rate", "GDP_growth", "realGDPGrowth"], raw)
+        if gdp == "N/A" and isinstance(raw.get("GDP"), dict):
+            gdp = _val(["change_percent", "current"], raw["GDP"])
         lines.append(f"GDP Growth: {gdp}%")
 
         # Unemployment
-        unemp = _val(["unemployment_rate", "unemployment", "unemploymentRate"], eco_data)
+        unemp = _val(["unemployment_rate", "unemployment", "unemploymentRate"], raw)
+        if unemp == "N/A" and isinstance(raw.get("UNRATE"), dict):
+            unemp = _val(["current", "previous"], raw["UNRATE"])
         lines.append(f"Unemployment Rate: {unemp}%")
 
         # PCE / consumer spending
-        pce = _val(["pce", "consumer_spending", "personalConsumptionExpenditures", "PCE"], eco_data)
+        pce = _val(["pce", "consumer_spending", "personalConsumptionExpenditures"], raw)
+        if pce == "N/A" and isinstance(raw.get("PCE"), dict):
+            pce = _val(["change_percent", "current"], raw["PCE"])
         lines.append(f"Consumer Spending (PCE): {pce}%")
 
         # CPI / inflation
-        cpi = _val(["cpi", "inflation_rate", "cpi_yoy", "CPI", "inflation"], eco_data)
+        cpi = _val(["cpi", "inflation_rate", "cpi_yoy", "inflation"], raw)
+        if cpi == "N/A" and isinstance(raw.get("CPIAUCSL"), dict):
+            cpi = _val(["change_percent", "current"], raw["CPIAUCSL"])
         lines.append(f"CPI / Inflation: {cpi}%")
 
         # Interest rates
-        rates = _val(["federal_funds_rate", "interest_rate", "fed_rate", "federalFundsRate"], eco_data)
+        rates = _val(["federal_funds_rate", "interest_rate", "fed_rate", "federalFundsRate"], raw)
+        if rates == "N/A" and isinstance(raw.get("DFF"), dict):
+            rates = _val(["current", "previous"], raw["DFF"])
         if rates != "N/A":
             lines.append(f"Federal Funds Rate: {rates}%")
 

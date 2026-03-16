@@ -12,14 +12,16 @@ GET    /session/{session_id}/claims
 POST   /session/{session_id}/process
 """
 import asyncio
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import redis.exceptions
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from backend.audio.ingestor import AudioIngestor, SUPPORTED_FORMATS
 from backend.audio.transcribe_client import TranscribeClient
@@ -74,19 +76,10 @@ class SessionStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _require_redis_session(session_id: str) -> dict:
-    """Load session from Redis, raise 404 if missing."""
-    try:
-        session = redis_store.get_session(session_id)
-    except redis.exceptions.ConnectionError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Redis is unavailable: {exc}",
-        )
+    """Load session, raise 404 if missing."""
+    session = redis_store.get_session(session_id)
     if session is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session '{session_id}' not found.",
-        )
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return session
 
 
@@ -95,25 +88,21 @@ def _require_redis_session(session_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/start", response_model=StartSessionResponse)
-async def start_session(body: StartSessionRequest):
+async def start_session(body: StartSessionRequest = None):
     """
     Create a new EarningsLens session.
 
     Stores session metadata in Redis and returns the session_id.
     """
+    if body is None:
+        body = StartSessionRequest()
     session_id = str(uuid.uuid4())
     metadata = {
         "ticker": body.ticker.upper(),
         "status": "created",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    try:
-        redis_store.update_session(session_id, metadata)
-    except redis.exceptions.ConnectionError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Redis is unavailable: {exc}",
-        )
+    redis_store.update_session(session_id, metadata)
     return StartSessionResponse(session_id=session_id)
 
 
@@ -158,18 +147,11 @@ async def upload_audio(session_id: str, file: UploadFile = File(...)):
             detail=f"Failed to start transcription job: {exc}",
         )
 
-    # Persist to Redis
-    try:
-        redis_store.update_session(
-            session_id,
-            {
-                "status": "transcribing",
-                "s3_uri": s3_uri,
-                "transcribe_job_name": job_name,
-            },
-        )
-    except redis.exceptions.ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=f"Redis is unavailable: {exc}")
+    redis_store.update_session(session_id, {
+        "status": "transcribing",
+        "s3_uri": s3_uri,
+        "transcribe_job_name": job_name,
+    })
 
     return UploadAudioResponse(
         session_id=session_id,
@@ -199,11 +181,7 @@ async def get_transcript(session_id: str):
 
     transcriber = TranscribeClient()
 
-    # Check for a cached completed transcript first
-    try:
-        cached_segments = redis_store.get_transcript(session_id)
-    except redis.exceptions.ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=f"Redis is unavailable: {exc}")
+    cached_segments = redis_store.get_transcript(session_id)
 
     if cached_segments:
         transcript_text = " ".join(s["text"] for s in cached_segments)
@@ -246,12 +224,8 @@ async def get_transcript(session_id: str):
     segments = transcriber.parse_transcript_segments(transcript_json)
     transcript_text = " ".join(s["text"] for s in segments)
 
-    # Cache in Redis
-    try:
-        redis_store.store_transcript(session_id, segments)
-        redis_store.update_session(session_id, {"status": "completed"})
-    except redis.exceptions.ConnectionError as exc:
-        raise HTTPException(status_code=503, detail=f"Redis is unavailable: {exc}")
+    redis_store.store_transcript(session_id, segments)
+    redis_store.update_session(session_id, {"status": "completed"})
 
     return TranscriptResponse(
         status="COMPLETED",
@@ -289,31 +263,62 @@ class PrefetchResponse(BaseModel):
     ticker: str
     cached_keys: list[str]
     status: str
+    macro_data: dict[str, float | list[str] | None] | None = None
+
+
+class MacroDebugResponse(BaseModel):
+    session_id: str
+    ticker: str | None = None
+    snapshot: dict[str, float | list[str] | None]
+    raw_cache: dict[str, dict]
 
 
 @router.post("/{session_id}/prefetch", response_model=PrefetchResponse)
 async def prefetch_macrodash(session_id: str, body: PrefetchRequest):
     """
-    Pre-fetch all MacroDash data (technical indicators, stock detail,
-    economic data, sentiment, news) concurrently and cache in Redis.
-
-    Returns the list of keys that were successfully cached.
+    Pre-fetch MacroDash data with a hard 20s cap. Returns whatever was
+    cached in time; slower endpoints are skipped gracefully.
     """
     _require_redis_session(session_id)
 
     ticker = body.ticker.upper()
-    client = MacroDashClient()
+    md_client = MacroDashClient()
 
-    data = await client.prefetch_all(ticker)
-    client.cache_to_redis(session_id, ticker, data)
+    try:
+        data = await asyncio.wait_for(md_client.prefetch_all(ticker), timeout=20.0)
+    except asyncio.TimeoutError:
+        logger.warning("MacroDash prefetch timed out for %s", ticker)
+        data = {}
 
+    md_client.cache_to_redis(session_id, ticker, data)
     cached_keys = [k for k, v in data.items() if v]
+    macro_data = md_client.build_demo_snapshot(data)
 
     return PrefetchResponse(
         session_id=session_id,
         ticker=ticker,
         cached_keys=cached_keys,
         status="ready",
+        macro_data=macro_data,
+    )
+
+
+@router.get("/{session_id}/macro-debug", response_model=MacroDebugResponse)
+async def get_macro_debug(session_id: str):
+    """
+    Return both the raw cached MacroDash payloads and the normalized snapshot
+    used by the UI/report layers.
+    """
+    session = _require_redis_session(session_id)
+    md_client = MacroDashClient()
+    raw_cache = md_client.get_all_cached(session_id)
+    snapshot = md_client.build_demo_snapshot(raw_cache)
+
+    return MacroDebugResponse(
+        session_id=session_id,
+        ticker=session.get("ticker"),
+        snapshot=snapshot,
+        raw_cache=raw_cache,
     )
 
 

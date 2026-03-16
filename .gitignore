@@ -5,3 +5,7 @@ node_modules/
 *.pyc
 dist/
 *.pdf
+data/*.mp3
+data/*.wav
+data/*_vectorstore.json
+*.wav

@@ -11,3 +11,6 @@ aiofiles==24.1.0
 reportlab==4.2.2
 nova-act
 gtts
+aws-sdk-bedrock-runtime
+smithy-aws-core
+smithy-core

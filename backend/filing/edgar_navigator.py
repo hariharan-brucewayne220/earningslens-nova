@@ -94,18 +94,49 @@ class EDGARNavigator:
             )
             return self._rest_download(ticker, output_dir)
 
+    @staticmethod
+    def _ensure_playwright_libs() -> None:
+        """
+        On WSL/headless Linux, Playwright needs libnspr4 and libnss3.
+        If they are not installed system-wide, we may have them extracted
+        under ~/.local/lib/x86_64-linux-gnu — add that dir to LD_LIBRARY_PATH.
+        """
+        user_lib = os.path.expanduser("~/.local/lib/x86_64-linux-gnu")
+        if os.path.isdir(user_lib):
+            current = os.environ.get("LD_LIBRARY_PATH", "")
+            if user_lib not in current:
+                os.environ["LD_LIBRARY_PATH"] = (
+                    f"{user_lib}:{current}" if current else user_lib
+                )
+                logger.debug("Added %s to LD_LIBRARY_PATH for Playwright", user_lib)
+
     def _nova_act_download(self, ticker: str, output_dir: str) -> dict:
-        """Use Nova Act to navigate EDGAR and download the latest 10-Q/10-K."""
+        """
+        Use Nova Act to navigate EDGAR and download the latest 10-Q/10-K.
+
+        Strategy:
+        1. Nova Act navigates to the EDGAR filing list for the ticker and clicks the
+           most recent 10-Q.  It then returns the current page URL (the filing index
+           page, e.g. .../Archives/edgar/data/{CIK}/{accession}-index.htm).
+        2. We parse the accession number and CIK from that reliable URL.
+        3. We use the existing REST helpers to derive the correct document download
+           URL from the index — avoiding any URL hallucination by the model.
+        """
         from nova_act import NovaAct
 
         api_key = os.getenv("NOVA_ACT_API_KEY")
         if not api_key:
             raise ValueError("NOVA_ACT_API_KEY is not set in the environment")
 
-        filing_url: Optional[str] = None
+        # Ensure Playwright can find libnspr4/libnss3 on WSL/headless systems
+        self._ensure_playwright_libs()
+
+        logger.info("Nova Act: navigating EDGAR for %s...", ticker)
+
+        index_url: Optional[str] = None
         form_type = "10-Q"
 
-        # First attempt: start on the EDGAR full-text search page for the ticker
+        # Start on the EDGAR company filing search page for the ticker
         edgar_search_url = (
             f"https://www.sec.gov/cgi-bin/browse-edgar"
             f"?action=getcompany&CIK={ticker}&type=10-Q&dateb=&owner=include&count=5"
@@ -117,27 +148,34 @@ class EDGARNavigator:
             headless=True,
             tty=False,
         ) as agent:
-            # Navigate to the most recent filing index page
+            # Step 1: Navigate to the most recent filing index page
             agent.act(
                 f"Click on the most recent 10-Q filing link in the filings table. "
                 f"If there is no 10-Q, click the most recent 10-K instead."
             )
 
-            # Extract the URL of the primary document from the filing index
-            result = agent.act_get(
-                "Find the primary document in this filing index (the main .htm or .pdf file, "
-                "NOT the index file itself). Return its full URL starting with https://www.sec.gov",
+            # Step 2: Return the current page URL (the filing index page).
+            # We ask for the URL of this page — not of any linked document — so the
+            # model reads it directly from the address bar rather than constructing it.
+            index_result = agent.act_get(
+                "What is the full URL of the current page you are on right now? "
+                "Return ONLY the URL, starting with https://www.sec.gov"
             )
+            index_url = self._extract_url_from_result(index_result)
 
-            filing_url = self._extract_url_from_result(result)
             # Detect whether we ended up with a 10-K
-            if result.response and "10-K" in result.response.upper():
+            if index_result.response and "10-K" in index_result.response.upper():
                 form_type = "10-K"
 
-        # Second attempt: broader search starting from the EDGAR home page
-        if not filing_url:
+        logger.info(
+            "Nova Act: arrived at filing index for %s — %s", ticker, index_url
+        )
+
+        # Fall back to second attempt if no URL was returned
+        if not index_url:
             logger.info(
-                "First Nova Act attempt did not return a URL for %s; trying broader search.",
+                "Nova Act first attempt did not return an index URL for %s; "
+                "trying broader search.",
                 ticker,
             )
             with NovaAct(
@@ -147,21 +185,66 @@ class EDGARNavigator:
                 tty=False,
             ) as agent2:
                 agent2.act(
-                    f"Search for the company with ticker symbol {ticker}. "
-                    f"Navigate to its filing page. Click the most recent 10-Q filing "
-                    f"(or 10-K if no 10-Q is available)."
+                    f"In the search box, type the ticker symbol {ticker} and search. "
+                    f"Then click the most recent 10-Q filing (or 10-K if none)."
                 )
-                result2 = agent2.act_get(
-                    "Find the primary document in this filing index (the main .htm or .pdf file). "
-                    "Return its full URL starting with https://www.sec.gov"
+                index_result2 = agent2.act_get(
+                    "What is the full URL of the current page you are on right now? "
+                    "Return ONLY the URL, starting with https://www.sec.gov"
                 )
-                filing_url = self._extract_url_from_result(result2)
-                if result2.response and "10-K" in result2.response.upper():
+                index_url = self._extract_url_from_result(index_result2)
+                if index_result2.response and "10-K" in index_result2.response.upper():
                     form_type = "10-K"
 
-        if not filing_url:
+        if not index_url:
             raise ValueError(
-                f"Nova Act could not locate a filing document URL for {ticker}"
+                f"Nova Act could not navigate to a filing index page for {ticker}"
+            )
+
+        # ------------------------------------------------------------------
+        # Parse the accession number and CIK from the filing index URL so we
+        # can build a verified download URL via the REST helper — this avoids
+        # any URL hallucination from the model.
+        #
+        # Expected URL pattern:
+        #   https://www.sec.gov/Archives/edgar/data/{CIK}/{ACCESSION}-index.htm
+        #   https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&...  (fallback)
+        # ------------------------------------------------------------------
+        accession, cik_from_url = self._parse_accession_from_index_url(index_url)
+
+        if accession and cik_from_url:
+            logger.info(
+                "Nova Act: parsed CIK=%s accession=%s from index URL",
+                cik_from_url,
+                accession,
+            )
+            # Find a PDF in the filing; fall back to primary document name via REST
+            pdf_doc = self._rest_find_pdf_in_filing(cik_from_url, accession)
+            if not pdf_doc:
+                # Fetch primary doc name from the submissions API
+                try:
+                    filing_meta = self._rest_get_latest_filing(ticker, form_type)
+                    pdf_doc = filing_meta["primary_document"]
+                    filing_date_str = filing_meta["filing_date"]
+                except Exception:
+                    filing_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+                    pdf_doc = None
+            else:
+                filing_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+            if pdf_doc:
+                filing_url = self._rest_get_filing_pdf_url(
+                    cik_from_url, accession, pdf_doc
+                )
+            else:
+                raise ValueError(
+                    f"Nova Act navigated to index page but could not determine "
+                    f"primary document filename for {ticker}"
+                )
+        else:
+            # The index URL is unusual; hand off to REST entirely
+            raise ValueError(
+                f"Nova Act returned unexpected index URL format for {ticker}: {index_url}"
             )
 
         logger.info("Nova Act resolved filing URL for %s: %s", ticker, filing_url)
@@ -173,8 +256,8 @@ class EDGARNavigator:
         if ext not in (".htm", ".html", ".pdf"):
             ext = ".htm"
 
-        filing_date = datetime.utcnow().strftime("%Y%m%d")
-        filename = f"{ticker}_{form_type.replace('-', '')}_{filing_date}{ext}"
+        safe_date = filing_date_str.replace("-", "")
+        filename = f"{ticker}_{form_type.replace('-', '')}_{safe_date}{ext}"
         local_path = str(Path(output_dir) / filename)
 
         with open(local_path, "wb") as fh:
@@ -185,20 +268,51 @@ class EDGARNavigator:
         # Upload to S3 (best-effort)
         s3_path = ""
         try:
-            s3_path = self.upload_to_s3(local_path, ticker, filing_date)
+            s3_path = self.upload_to_s3(local_path, ticker, safe_date)
         except Exception as exc:
             logger.warning("S3 upload failed (non-fatal): %s", exc)
 
         return {
             "ticker": ticker,
             "form_type": form_type,
-            "filing_date": filing_date,
+            "filing_date": filing_date_str,
             "local_path": local_path,
             "s3_path": s3_path,
             "filing_url": filing_url,
             "status": "ready",
             "method": "nova_act",
         }
+
+    @staticmethod
+    def _parse_accession_from_index_url(url: str):
+        """
+        Extract (accession_dashed, cik) from an EDGAR Archives index URL.
+
+        Pattern: /Archives/edgar/data/{CIK}/{ACCESSION_NO_DASHES}/{ACCESSION}-index.htm
+            e.g. /Archives/edgar/data/1045810/000104581024000123/0001045810-24-000123-index.htm
+        Returns (accession_dashed, cik_str) or (None, None).
+        """
+        # Try to match the Archives URL pattern
+        m = re.search(
+            r"/Archives/edgar/data/(\d+)/(\d{18})/",
+            url,
+        )
+        if m:
+            cik = m.group(1)
+            accession_no_dashes = m.group(2)
+            # Convert to dashed format: XXXXXXXXXX-YY-ZZZZZZ
+            acc = f"{accession_no_dashes[:10]}-{accession_no_dashes[10:12]}-{accession_no_dashes[12:]}"
+            return acc, cik
+
+        # Also try the -index.htm filename pattern
+        m2 = re.search(
+            r"/Archives/edgar/data/(\d+)/(\d{10}-\d{2}-\d{6})-index\.htm",
+            url,
+        )
+        if m2:
+            return m2.group(2), m2.group(1)
+
+        return None, None
 
     def _extract_url_from_result(self, result) -> Optional[str]:
         """

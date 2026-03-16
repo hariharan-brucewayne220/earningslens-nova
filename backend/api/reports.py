@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.audio import redis_store
+from backend.macrodash.client import MacroDashClient
 from backend.report.json_exporter import generate_json_report
 from backend.report.pdf_exporter import generate_pdf_report
 
@@ -61,6 +62,24 @@ def _get_ticker(session_id: str, session: dict, query_ticker: str | None) -> str
     return ticker.upper()
 
 
+async def _ensure_macrodash_cache(session_id: str, ticker: str) -> None:
+    """
+    Backfill MacroDash cache for report generation if the session has no
+    cached market payloads yet.
+    """
+    client = MacroDashClient()
+    cached = client.get_all_cached(session_id)
+    if any(cached.get(key) for key in cached):
+        return
+
+    try:
+        data = await client.prefetch_all(ticker)
+        client.cache_to_redis(session_id, ticker, data)
+        logger.info("Backfilled MacroDash cache for report generation: %s %s", session_id, ticker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MacroDash backfill failed for report %s/%s: %s", session_id, ticker, exc)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -76,6 +95,7 @@ async def get_json_report(session_id: str, ticker: str | None = None):
     """
     session = _require_redis_session(session_id)
     resolved_ticker = _get_ticker(session_id, session, ticker)
+    await _ensure_macrodash_cache(session_id, resolved_ticker)
 
     try:
         report = generate_json_report(session_id, resolved_ticker)
@@ -97,6 +117,7 @@ async def get_pdf_report(session_id: str, ticker: str | None = None):
     """
     session = _require_redis_session(session_id)
     resolved_ticker = _get_ticker(session_id, session, ticker)
+    await _ensure_macrodash_cache(session_id, resolved_ticker)
 
     # Write to a deterministic path inside data/ so the file persists for
     # the session lifetime; also allows re-download without regenerating.

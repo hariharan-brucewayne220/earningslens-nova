@@ -9,6 +9,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from backend.macrodash.client import MacroDashClient
 from backend.verification.pipeline import VerificationPipeline
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,9 @@ def generate_json_report(session_id: str, ticker: str) -> dict:
     flagged = len(flagged_out)
     unverifiable = sum(1 for c in claims_out if c["verdict"] == "UNVERIFIABLE")
     verification_rate = round(verified / total, 4) if total > 0 else 0.0
+    macrodash_client = MacroDashClient()
+    macrodash_cache = macrodash_client.get_all_cached(session_id)
+    market_snapshot = macrodash_client.build_demo_snapshot(macrodash_cache)
 
     report = {
         "session_id": session_id,
@@ -77,6 +81,14 @@ def generate_json_report(session_id: str, ticker: str) -> dict:
         },
         "claims": claims_out,
         "flagged_claims": flagged_out,
+        "market_context": {
+            "snapshot": market_snapshot,
+            "technical_indicators": macrodash_cache.get("technical_indicators", {}),
+            "stock_detail": macrodash_cache.get("stock_detail", {}),
+            "economic_data": macrodash_cache.get("economic_data", {}),
+            "sentiment": macrodash_cache.get("sentiment", {}),
+            "news_headlines": market_snapshot.get("news_headlines", []),
+        },
     }
 
     logger.info(

@@ -55,6 +55,7 @@ class FetchFilingResponse(BaseModel):
     s3_path: str
     local_path: str
     status: str
+    method: str = "rest_api"  # "nova_act" | "rest_api" — visible in frontend badge
 
 
 class FilingStatusResponse(BaseModel):
@@ -64,6 +65,7 @@ class FilingStatusResponse(BaseModel):
     s3_path: Optional[str] = None
     local_path: Optional[str] = None
     status: str
+    method: Optional[str] = None  # "nova_act" | "rest_api"
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +109,7 @@ async def fetch_filing(body: FetchFilingRequest):
         "local_path": result["local_path"],
         "s3_path": s3_path,
         "status": "ready",
+        "method": result.get("method", "rest_api"),
     }
     try:
         r = _get_redis()
@@ -121,6 +124,7 @@ async def fetch_filing(body: FetchFilingRequest):
         s3_path=s3_path,
         local_path=result["local_path"],
         status="ready",
+        method=result.get("method", "rest_api"),
     )
 
 
@@ -144,4 +148,5 @@ async def get_filing_status(ticker: str):
         s3_path=data.get("s3_path"),
         local_path=data.get("local_path"),
         status=data.get("status", "unknown"),
+        method=data.get("method"),
     )

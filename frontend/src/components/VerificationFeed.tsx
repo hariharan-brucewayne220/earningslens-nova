@@ -1,110 +1,129 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { Claim } from '../types';
 
 interface VerificationFeedProps {
   claims: Claim[];
 }
 
-const VERDICT_STYLES: Record<Claim['verdict'], { badge: string; border: string; bg: string }> = {
+const VERDICT_CONFIG = {
   VERIFIED: {
-    badge: 'bg-green-900 text-green-400 border border-green-700',
-    border: 'border-l-green-500',
-    bg: 'hover:bg-green-950/20',
+    badge: 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30',
+    borderClass: 'border-verified',
+    dot: 'bg-emerald-500',
+    label: 'Verified',
   },
   FLAGGED: {
-    badge: 'bg-red-900 text-red-400 border border-red-700',
-    border: 'border-l-red-500',
-    bg: 'hover:bg-red-950/20',
+    badge: 'bg-rose-500/15 text-rose-400 ring-1 ring-rose-500/30',
+    borderClass: 'border-flagged',
+    dot: 'bg-rose-500',
+    label: 'Flagged',
   },
   UNVERIFIABLE: {
-    badge: 'bg-yellow-900 text-yellow-400 border border-yellow-700',
-    border: 'border-l-yellow-500',
-    bg: 'hover:bg-yellow-950/20',
+    badge: 'bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30',
+    borderClass: 'border-unverifiable',
+    dot: 'bg-amber-500',
+    label: 'Unverifiable',
   },
-};
+} as const;
+
+function ConfidenceBar({ pct, verdict }: { pct: number; verdict: Claim['verdict'] }) {
+  const color =
+    verdict === 'VERIFIED' ? '#10b981' :
+    verdict === 'FLAGGED'  ? '#f43f5e' : '#f59e0b';
+  return (
+    <div className="confidence-bar flex-1">
+      <div
+        className="confidence-bar-fill"
+        style={{ width: `${Math.round(pct)}%`, background: color }}
+      />
+    </div>
+  );
+}
 
 function ClaimCard({ claim, isNew }: { claim: Claim; isNew: boolean }) {
-  const [expanded, setExpanded] = useState(false);
-  const styles = VERDICT_STYLES[claim.verdict];
+  const cfg = VERDICT_CONFIG[claim.verdict];
+  const pct = Math.round(claim.confidence * 100);
+  const filingMatchText =
+    typeof claim.filing_match === 'string'
+      ? claim.filing_match
+      : claim.filing_match != null
+      ? String(claim.filing_match)
+      : '';
+
+  // Deduplicate: don't show filing_match if it's basically the same as explanation
+  const showFilingMatch =
+    filingMatchText &&
+    filingMatchText.trim().length > 10 &&
+    claim.explanation &&
+    filingMatchText.trim().toLowerCase().slice(0, 40) !==
+      claim.explanation.trim().toLowerCase().slice(0, 40);
 
   return (
     <div
-      className={`bg-gray-900 border border-gray-800 border-l-2 ${styles.border} ${styles.bg} rounded-lg overflow-hidden transition-colors ${isNew ? 'claim-card-enter' : ''}`}
+      className={`glass-card rounded-xl overflow-hidden transition-all duration-200 ${cfg.borderClass} ${isNew ? 'claim-card-enter' : ''}`}
     >
-      <div
-        className="px-4 py-3 cursor-pointer"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-gray-200 line-clamp-2 leading-snug">
-              {claim.claim_text}
-            </p>
-            <div className="flex items-center gap-2 mt-2">
-              {claim.metric && (
-                <span className="text-xs font-mono text-gray-500">
-                  {claim.metric}
-                </span>
-              )}
-              {claim.value && (
-                <span className="text-xs font-mono text-gray-400 bg-gray-800 px-1.5 py-0.5 rounded">
-                  {claim.value}
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="flex flex-col items-end gap-1.5 shrink-0">
-            <span className={`text-xs font-medium px-2 py-0.5 rounded ${styles.badge}`}>
-              {claim.verdict}
-            </span>
-            <span className="text-xs text-gray-500 font-mono">
-              {Math.round(claim.confidence * 100)}%
-            </span>
-          </div>
+      {/* Header row */}
+      <div className="px-4 pt-3 pb-2 flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className={`w-1.5 h-1.5 rounded-full shrink-0 mt-0.5 ${cfg.dot}`} />
+          <span className={`text-xs font-semibold px-2 py-0.5 rounded-md ${cfg.badge}`}>
+            {cfg.label}
+          </span>
         </div>
-
-        <div className="flex items-center justify-end mt-1">
-          {expanded ? (
-            <ChevronUp size={12} className="text-gray-600" />
-          ) : (
-            <ChevronDown size={12} className="text-gray-600" />
-          )}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-xs font-mono text-slate-500">{pct}%</span>
+          <ConfidenceBar pct={pct} verdict={claim.verdict} />
         </div>
       </div>
 
-      {expanded && (
-        <div className="border-t border-gray-800 px-4 py-3 space-y-3 text-xs">
-          {claim.filing_match && (
-            <div>
-              <p className="text-gray-500 uppercase tracking-widest mb-1">Filing Match</p>
-              <p className="text-gray-300 leading-relaxed">{claim.filing_match}</p>
-            </div>
+      {/* Claim text */}
+      <div className="px-4 pb-2">
+        <p className="text-sm text-slate-200 leading-relaxed">
+          {claim.claim_text}
+        </p>
+      </div>
+
+      {/* Metric / Value / Delta row */}
+      {(claim.metric || claim.value || claim.filing_delta) && (
+        <div className="px-4 pb-3 flex items-center gap-2 flex-wrap">
+          {claim.metric && (
+            <span className="section-label">{claim.metric}</span>
+          )}
+          {claim.metric && claim.value && (
+            <span className="text-slate-600 text-xs">·</span>
+          )}
+          {claim.value && (
+            <span className="text-xs font-mono text-slate-300 bg-white/5 px-2 py-0.5 rounded">
+              {claim.value}
+            </span>
           )}
           {claim.filing_delta && (
-            <div>
-              <p className="text-gray-500 uppercase tracking-widest mb-1">Delta</p>
-              <p className="text-gray-300 font-mono">{claim.filing_delta}</p>
-            </div>
+            <span className={`text-xs font-mono px-2 py-0.5 rounded ${
+              claim.verdict === 'FLAGGED'
+                ? 'bg-rose-500/15 text-rose-400'
+                : 'bg-slate-700/60 text-slate-400'
+            }`}>
+              Δ {claim.filing_delta}
+            </span>
           )}
-          {claim.technical_context && (
-            <div>
-              <p className="text-gray-500 uppercase tracking-widest mb-1">Technical Context</p>
-              <p className="text-gray-400 leading-relaxed">{claim.technical_context}</p>
-            </div>
-          )}
-          {claim.macro_context && (
-            <div>
-              <p className="text-gray-500 uppercase tracking-widest mb-1">Macro Context</p>
-              <p className="text-gray-400 leading-relaxed">{claim.macro_context}</p>
-            </div>
-          )}
-          {claim.explanation && (
-            <div>
-              <p className="text-gray-500 uppercase tracking-widest mb-1">Explanation</p>
-              <p className="text-gray-300 leading-relaxed">{claim.explanation}</p>
-            </div>
-          )}
+        </div>
+      )}
+
+      {/* Explanation */}
+      {claim.explanation && (
+        <div className="px-4 pb-3">
+          <p className="text-xs text-slate-400 leading-relaxed">
+            {claim.explanation}
+          </p>
+        </div>
+      )}
+
+      {/* Filing match quote — only if distinct from explanation */}
+      {showFilingMatch && (
+        <div className="mx-4 mb-3 px-3 py-2 rounded-lg bg-white/[0.03] border-l-2 border-slate-600">
+          <span className="section-label block mb-1">SEC Filing</span>
+          <p className="text-xs text-slate-500 leading-relaxed italic">
+            "{filingMatchText}"
+          </p>
         </div>
       )}
     </div>
@@ -112,29 +131,35 @@ function ClaimCard({ claim, isNew }: { claim: Claim; isNew: boolean }) {
 }
 
 export function VerificationFeed({ claims }: VerificationFeedProps) {
-  // Newest first
   const ordered = [...claims].reverse();
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-800">
-        <h2 className="text-sm font-medium text-gray-300 uppercase tracking-widest">
-          Verification Feed
-        </h2>
-        <span className="ml-auto text-xs text-gray-600 font-mono">
-          {claims.length} claims
-        </span>
+    <div className="flex flex-col h-full min-h-0">
+      {/* Panel header */}
+      <div className="flex items-center gap-3 px-4 py-3 border-b border-white/[0.06] shrink-0">
+        <h2 className="section-label">Verification Feed</h2>
+        {claims.length > 0 && (
+          <span
+            className="ml-auto text-xs font-mono"
+            style={{ color: 'rgba(148,163,184,0.4)' }}
+          >
+            {claims.length} claim{claims.length !== 1 ? 's' : ''}
+          </span>
+        )}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2.5">
         {ordered.length === 0 ? (
-          <div className="flex items-center justify-center h-full">
-            <p className="text-gray-600 text-sm">No claims verified yet…</p>
+          <div className="flex flex-col items-center justify-center h-full gap-3 opacity-40">
+            <div className="w-8 h-8 rounded-full border border-slate-700 flex items-center justify-center">
+              <div className="w-2 h-2 rounded-full bg-slate-600 pulse-dot" />
+            </div>
+            <p className="text-xs text-slate-500">Awaiting claims…</p>
           </div>
         ) : (
           ordered.map((claim, idx) => (
             <ClaimCard
-              key={`${claim.claim_text.slice(0, 20)}-${idx}`}
+              key={`${(claim.claim_text ?? '').slice(0, 30)}-${idx}`}
               claim={claim}
               isNew={idx === 0}
             />

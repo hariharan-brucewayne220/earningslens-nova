@@ -74,6 +74,8 @@ Claude has full permission to take ALL of the following actions without asking f
 
 **Never ask "would you like me to…" or "shall I proceed?" — just do it.**
 
+**Agent concurrency rule: Never run more than 5 subagents simultaneously. Dispatch sequentially or in small batches (max 3 at once) to keep context clean and avoid conflicts.**
+
 ---
 
 ## Nova Component Mapping (All Four — All Necessary)

@@ -13,8 +13,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-import redis
 from dotenv import load_dotenv
+from backend.audio import redis_store as _store
 
 from backend.macrodash.client import MacroDashClient
 from backend.verification.claim_extractor import ClaimExtractor
@@ -24,8 +24,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-RESULTS_TTL = 86_400  # 24 hours
+# In-memory results store (keyed by session_id)
+_results: dict[str, list[dict]] = {}
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
@@ -146,47 +146,18 @@ class VerificationPipeline:
 
     def get_all_results(self) -> list[dict]:
         """Retrieve all stored verification results for this session."""
-        client = self._get_redis()
-        key = f"results:{self.session_id}"
-        try:
-            raw = client.get(key)
-            if raw is None:
-                return []
-            return json.loads(raw)
-        except Exception as exc:
-            logger.warning("Failed to read results from Redis: %s", exc)
-            return []
+        return _results.get(self.session_id, [])
 
     def _append_results(self, new_results: list[dict]) -> None:
-        """Append new_results to the stored results list in Redis."""
-        client = self._get_redis()
-        key = f"results:{self.session_id}"
-        try:
-            raw = client.get(key)
-            existing: list[dict[str, Any]] = json.loads(raw) if raw else []
-            existing.extend(new_results)
-            client.set(key, json.dumps(existing), ex=RESULTS_TTL)
-        except Exception as exc:
-            logger.warning("Failed to append results to Redis: %s", exc)
+        """Append new_results to the stored results list."""
+        existing = _results.get(self.session_id, [])
+        existing.extend(new_results)
+        _results[self.session_id] = existing
 
     def _get_transcript_text(self) -> str:
-        """Read the full transcript text from Redis for this session."""
-        client = self._get_redis()
-        key = f"transcript:{self.session_id}"
-        try:
-            raw = client.get(key)
-            if raw is None:
-                return ""
-            segments = json.loads(raw)
-            if isinstance(segments, list):
-                return " ".join(s.get("text", "") for s in segments)
-            if isinstance(segments, str):
-                return segments
-            return ""
-        except Exception as exc:
-            logger.warning("Failed to read transcript from Redis: %s", exc)
-            return ""
+        """Read the full transcript text for this session."""
+        segments = _store.get_transcript(self.session_id)
+        if isinstance(segments, list):
+            return " ".join(s.get("text", "") for s in segments)
+        return ""
 
-    @staticmethod
-    def _get_redis() -> redis.Redis:
-        return redis.from_url(REDIS_URL, decode_responses=True)
