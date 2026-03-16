@@ -166,6 +166,6 @@ earningslens-nova/
 
 ## Team
 
-Built by Hariharan Rajendran for the Amazon Nova AI Hackathon.
+Built by Hariharan for the Amazon Nova AI Hackathon.
 
 MacroDash — the financial dashboard powering the market data layer — is the team's prior production project.
