@@ -10,7 +10,7 @@ Built for the [Amazon Nova AI Hackathon](https://devpost.com/software/earningsle
 
 ## Demo
 
-![EarningsLens Dashboard](design.png)
+![EarningsLens Dashboard](nova.png)
 
 ---
 
