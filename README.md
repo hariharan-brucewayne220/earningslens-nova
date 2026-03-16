@@ -11,6 +11,7 @@ Built for the [Amazon Nova AI Hackathon](https://devpost.com/software/earningsle
 ## Demo
 
 ![EarningsLens Dashboard](nova.png)
+*Left: rolling earnings call transcript with highlighted claims. Right: verification feed showing VERIFIED/FLAGGED verdicts cross-referenced against SEC filings, technical indicators, and FRED macro data.*
 
 ---
 
